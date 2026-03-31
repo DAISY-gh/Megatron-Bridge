@@ -305,8 +305,51 @@ def get_batch(data_iterator: Iterable, cfg: ConfigContainer, use_mtp: bool = Fal
     visual_inputs = batch.get("visual_inputs")
     cp_size = pg_collection.cp.size() if pg_collection is not None and pg_collection.cp is not None else 1
 
+    # Energon pre-packed path: cu_seqlens already present from TaskEncoder packing
+    energon_cu_seqlens = batch.get("cu_seqlens")
+    if energon_cu_seqlens is not None:
+        tokens_or_input = batch.get("tokens") if batch.get("tokens") is not None else batch.get("input_ids")
+        energon_max_seqlen = batch.get("max_seqlen")
+        energon_cu_argmin = batch.get("cu_seqlens_argmin")
+
+        # Log detailed iteration stats for FLOPs analysis
+        if tokens_or_input is not None:
+            _seq_dim = tokens_or_input.shape[-1]
+            if energon_cu_seqlens.dim() == 1:
+                _content_len = energon_cu_seqlens[-1].item()
+            elif energon_cu_argmin is not None:
+                _argmin_val = energon_cu_argmin.item() if energon_cu_argmin.dim() == 0 else energon_cu_argmin[0].item()
+                _content_len = energon_cu_seqlens[0, _argmin_val - 1].item()
+            else:
+                _content_len = energon_cu_seqlens[0, -1].item()
+            _pad_len = _seq_dim - _content_len
+            _n_img_toks = int((tokens_or_input == 151655).sum().item())
+            _vit_shape = (
+                visual_inputs.pixel_values.shape
+                if visual_inputs is not None and visual_inputs.pixel_values is not None
+                else "None"
+            )
+            logger.info(
+                f"[IterStats] decoder_input={list(tokens_or_input.shape)}, "
+                f"content={_content_len}, pad={_pad_len}, "
+                f"image_tokens_in_decoder={_n_img_toks}, "
+                f"vit_input={_vit_shape}"
+            )
+
+        return (
+            tokens_or_input,
+            batch.get("labels"),
+            batch.get("loss_mask"),
+            batch.get("attention_mask"),
+            batch.get("position_ids"),
+            energon_cu_seqlens,
+            energon_max_seqlen,
+            visual_inputs,
+            energon_cu_argmin,
+        )
+
     if enable_packing:
-        # Pack sequences
+        # In-batch packing (concatenate all micro-batch sequences)
         tokens_or_input = batch.get("tokens") if batch.get("tokens") is not None else batch.get("input_ids")
         (
             packed_tokens,
@@ -326,7 +369,6 @@ def get_batch(data_iterator: Iterable, cfg: ConfigContainer, use_mtp: bool = Fal
             pad_to_multiple_of=cp_size * 2 if cp_size > 1 else 1,
         )
 
-        # Update batch dict with packed tensors
         if batch.get("tokens") is not None:
             batch["tokens"] = packed_tokens
         else:
@@ -336,10 +378,8 @@ def get_batch(data_iterator: Iterable, cfg: ConfigContainer, use_mtp: bool = Fal
         batch["attention_mask"] = packed_attention_mask
         batch["position_ids"] = packed_position_ids
 
-        # # Add packing metadata
-        logger.debug(f"Packed batch: cu_seqlens={cu_seqlens.tolist()}, max_seqlen={max_seqlen}")
+        logger.debug(f"In-batch packed: cu_seqlens={cu_seqlens.tolist()}, max_seqlen={max_seqlen}")
     else:
-        # No packing, use dummy values
         cu_seqlens = None
         max_seqlen = None
 
@@ -352,6 +392,7 @@ def get_batch(data_iterator: Iterable, cfg: ConfigContainer, use_mtp: bool = Fal
         cu_seqlens,
         max_seqlen,
         visual_inputs,
+        None,  # cu_seqlens_argmin (only set for Energon pre-packed path)
     )
 
 
@@ -387,6 +428,7 @@ def forward_step(
             cu_seqlens,
             max_seqlen,
             visual_inputs,
+            cu_seqlens_argmin,
         ) = get_batch(data_iterator, state.cfg, use_mtp, pg_collection=pg_collection)
     timers("batch-generator").stop()
 
@@ -403,13 +445,15 @@ def forward_step(
 
     # Add packed sequence support
     if cu_seqlens is not None:
-        cu_seqlens_argmin = torch.tensor(len(cu_seqlens))  # no padding in cu_seqlens since packing is done in-batch
-        packed_seq_params = {
+        packed_seq_dict = {
             "cu_seqlens": cu_seqlens,
             "max_seqlen": max_seqlen,
-            "cu_seqlens_argmin": cu_seqlens_argmin,
         }
-        forward_args["packed_seq_params"] = get_packed_seq_params(packed_seq_params)
+        if cu_seqlens_argmin is not None:
+            packed_seq_dict["cu_seqlens_argmin"] = cu_seqlens_argmin
+        elif cu_seqlens.dim() == 1:
+            packed_seq_dict["cu_seqlens_argmin"] = torch.tensor(len(cu_seqlens))
+        forward_args["packed_seq_params"] = get_packed_seq_params(packed_seq_dict)
 
     check_for_nan_in_loss = state.cfg.rerun_state_machine.check_for_nan_in_loss
     check_for_spiky_loss = state.cfg.rerun_state_machine.check_for_spiky_loss
