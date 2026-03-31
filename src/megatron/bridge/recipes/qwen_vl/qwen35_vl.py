@@ -21,10 +21,13 @@ This module provides SFT and PEFT configurations for Qwen3.5-VL models:
 """
 
 import torch
+from transformers import AutoProcessor, AutoTokenizer
 
 from megatron.bridge import AutoBridge
+from megatron.bridge.data.energon.energon_provider import EnergonProvider
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.recipes.common import _peft_common_vlm, _sft_common_vlm
+from megatron.bridge.recipes.qwen_vl.data.energon.task_encoder import QwenVLTaskEncoder
 from megatron.bridge.recipes.utils.finetune_utils import default_peft_config
 from megatron.bridge.recipes.utils.optimizer_utils import distributed_fused_adam_with_cosine_annealing
 from megatron.bridge.training.config import ConfigContainer
@@ -294,6 +297,40 @@ def qwen35_vl_35b_a3b_sft_config(hf_path: str = "Qwen/Qwen3.5-35B-A3B") -> Confi
     cfg = _sft_common_vlm()
     _qwen35_vl_apply_common(cfg, hf_path, tp=2, pp=1, max_lr=2e-5, min_lr=2e-6)
     _qwen35_vl_apply_moe(cfg, ep=16)
+    return cfg
+
+
+def _make_energon_dataset_35(hf_path: str, seq_length: int = 4096) -> EnergonProvider:
+    tokenizer = AutoTokenizer.from_pretrained(hf_path, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(hf_path, trust_remote_code=True)
+    image_processor = processor.image_processor
+
+    task_encoder = QwenVLTaskEncoder(
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+        max_padding_length=seq_length,
+    )
+
+    return EnergonProvider(
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+        seq_length=seq_length,
+        task_encoder=task_encoder,
+    )
+
+
+def qwen35_vl_35b_a3b_sft_energon_config(hf_path: str = "Qwen/Qwen3.5-35B-A3B") -> ConfigContainer:
+    """Return a full SFT config for Qwen3.5-VL 35B-A3B using Energon Provider.
+
+    Same as qwen35_vl_35b_a3b_sft_config but replaces
+    HFDatasetConversationProvider with EnergonProvider + QwenVLTaskEncoder
+    for WebDataset-based THD packing.
+
+    CLI overrides for dataset.path, dataset.packing_buffer_size, etc.
+    are applied on top of EnergonProvider (which owns those fields).
+    """
+    cfg = qwen35_vl_35b_a3b_sft_config(hf_path=hf_path)
+    cfg.dataset = _make_energon_dataset_35(hf_path, seq_length=cfg.model.seq_length)
     return cfg
 
 
