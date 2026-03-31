@@ -20,14 +20,18 @@ import pickle
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
-from megatron.energon import Batch, DefaultTaskEncoder, stateless
-from megatron.energon.epathlib.epath import EPath
-from megatron.energon.flavors.base_dataset import Sample
-from megatron.energon.flavors.webdataset import DefaultDecoderWebdatasetFactory
+from megatron.energon import (
+    Batch,
+    DefaultDecoderWebdatasetFactory,
+    DefaultTaskEncoder,
+    Sample,
+    stateless,
+)
+from megatron.energon.epathlib import EPath
 from transformers import BatchEncoding
 from webdataset.autodecode import Decoder, imagehandler
 
@@ -272,6 +276,29 @@ class videohandler:
         return data
 
 
+class _ChatMLDecoder:
+    """SampleDecoder-compatible wrapper for ChatML image + video decoding.
+
+    Wraps webdataset Decoder with imagehandler and custom videohandler,
+    exposing the config() interface required by energon >= 7.x.
+    """
+
+    def __init__(self, image_decode: str = "torchrgb"):
+        self._config: Dict[str, Any] = {"image_decode": image_decode}
+        self._decoder = Decoder(
+            [
+                imagehandler(image_decode),
+                videohandler(image_decode),
+            ]
+        )
+
+    def __call__(self, sample: dict) -> dict:
+        return self._decoder(sample)
+
+    def config(self) -> Dict[str, Any]:
+        return self._config
+
+
 class ChatMLWebdataset(DefaultDecoderWebdatasetFactory[ChatMLSample]):
     """Webdataset factory for multi-turn ChatML samples with multimodal support.
 
@@ -281,20 +308,10 @@ class ChatMLWebdataset(DefaultDecoderWebdatasetFactory[ChatMLSample]):
 
     __sample_type__ = ChatMLSample
 
-    def __init__(self, path: EPath, *, auto_decode: bool = True, **kwargs):
-        try:
-            super().__init__(path, auto_decode=auto_decode, **kwargs)
-        except TypeError:
-            kwargs.pop("auto_decode", None)
-            super().__init__(path, **kwargs)
-        if auto_decode:
-            decode_spec = getattr(self, "image_decode", "torchrgb")
-            self._decoder = Decoder(
-                [
-                    imagehandler(decode_spec),
-                    videohandler(decode_spec),
-                ]
-            )
+    def __init__(self, path: EPath, **kwargs):
+        decode_spec = kwargs.pop("image_decode", "torchrgb")
+        decoder = _ChatMLDecoder(image_decode=decode_spec)
+        super().__init__(path, decoder=decoder, **kwargs)
 
 
 @dataclass
@@ -423,6 +440,7 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
         self.seq_len = max_padding_length
         self.image_token_id, self.video_token_id = _resolve_hf_mm_token_ids(self.hf_tokenizer)
 
+    @stateless
     def encode_sample(self, sample: ChatMLSample):
         """
         Encode sample to meet training requirement.
@@ -787,6 +805,7 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
 
         return imgs, image_thw_grids, videos, video_thw_grids
 
+    @stateless
     def batch(self, samples: List[Union[QwenVLTaskSample, QwenVLTaskSamplePacked]]) -> QwenVLTaskBatch:
         """
         Put encoded sample into Batch, do padding, add labels and visual input masks.
@@ -932,6 +951,7 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
         )
         return batch_obj
 
+    @stateless
     def encode_batch(self, batch: QwenVLTaskBatch) -> dict:
         """Encode batch in dict"""
 

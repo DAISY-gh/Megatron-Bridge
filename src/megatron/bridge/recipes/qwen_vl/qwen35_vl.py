@@ -303,17 +303,16 @@ def qwen35_vl_35b_a3b_sft_config(hf_path: str = "Qwen/Qwen3.5-35B-A3B") -> Confi
 def _make_energon_dataset_35(hf_path: str, seq_length: int = 4096) -> EnergonProvider:
     tokenizer = AutoTokenizer.from_pretrained(hf_path, trust_remote_code=True)
     processor = AutoProcessor.from_pretrained(hf_path, trust_remote_code=True)
-    image_processor = processor.image_processor
 
     task_encoder = QwenVLTaskEncoder(
         tokenizer=tokenizer,
-        image_processor=image_processor,
+        image_processor=processor,
         max_padding_length=seq_length,
     )
 
     return EnergonProvider(
         path="",
-        image_processor=image_processor,
+        image_processor=processor,
         seq_length=seq_length,
         micro_batch_size=1,
         global_batch_size=1,
