@@ -282,7 +282,11 @@ class ChatMLWebdataset(DefaultDecoderWebdatasetFactory[ChatMLSample]):
     __sample_type__ = ChatMLSample
 
     def __init__(self, path: EPath, *, auto_decode: bool = True, **kwargs):
-        super().__init__(path, auto_decode=auto_decode, **kwargs)
+        try:
+            super().__init__(path, auto_decode=auto_decode, **kwargs)
+        except TypeError:
+            kwargs.pop("auto_decode", None)
+            super().__init__(path, **kwargs)
         if auto_decode:
             self._decoder = Decoder(
                 [
