@@ -287,7 +287,7 @@ class ChatMLWebdataset(DefaultDecoderWebdatasetFactory[ChatMLSample]):
         except TypeError:
             kwargs.pop("auto_decode", None)
             super().__init__(path, **kwargs)
-        if auto_decode:
+        if auto_decode and hasattr(self, "image_decode"):
             self._decoder = Decoder(
                 [
                     imagehandler(self.image_decode),
