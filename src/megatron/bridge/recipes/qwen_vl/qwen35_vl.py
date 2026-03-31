@@ -312,9 +312,12 @@ def _make_energon_dataset_35(hf_path: str, seq_length: int = 4096) -> EnergonPro
     )
 
     return EnergonProvider(
-        tokenizer=tokenizer,
+        path="",
         image_processor=image_processor,
         seq_length=seq_length,
+        micro_batch_size=1,
+        global_batch_size=1,
+        num_workers=2,
         task_encoder=task_encoder,
     )
 
