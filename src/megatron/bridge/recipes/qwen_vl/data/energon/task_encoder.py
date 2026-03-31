@@ -287,11 +287,12 @@ class ChatMLWebdataset(DefaultDecoderWebdatasetFactory[ChatMLSample]):
         except TypeError:
             kwargs.pop("auto_decode", None)
             super().__init__(path, **kwargs)
-        if auto_decode and hasattr(self, "image_decode"):
+        if auto_decode:
+            decode_spec = getattr(self, "image_decode", "torchrgb")
             self._decoder = Decoder(
                 [
-                    imagehandler(self.image_decode),
-                    videohandler(self.image_decode),
+                    imagehandler(decode_spec),
+                    videohandler(decode_spec),
                 ]
             )
 
