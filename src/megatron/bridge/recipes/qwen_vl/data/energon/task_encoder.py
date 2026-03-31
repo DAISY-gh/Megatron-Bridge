@@ -310,6 +310,7 @@ class ChatMLWebdataset(DefaultDecoderWebdatasetFactory[ChatMLSample]):
 
     def __init__(self, path: EPath, **kwargs):
         decode_spec = kwargs.pop("image_decode", "torchrgb")
+        kwargs.pop("decoder", None)
         decoder = _ChatMLDecoder(image_decode=decode_spec)
         super().__init__(path, decoder=decoder, **kwargs)
 
