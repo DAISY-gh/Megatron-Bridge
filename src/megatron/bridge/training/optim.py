@@ -19,8 +19,12 @@ from megatron.core.optimizer import (
     MegatronOptimizer,
     OptimizerConfig,
     get_megatron_optimizer,
-    get_mup_config_overrides,
 )
+
+try:
+    from megatron.core.optimizer import get_mup_config_overrides
+except ImportError:
+    get_mup_config_overrides = None
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
