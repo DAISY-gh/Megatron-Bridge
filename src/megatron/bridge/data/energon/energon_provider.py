@@ -41,7 +41,7 @@ class EnergonProvider(DatasetProvider):
         assert self.path, "EnergonProvider.path must be set. Use CLI override: dataset.path=<path>"
         dataset = EnergonMultiModalDataModule(
             path=self.path,
-            tokenizer=context.tokenizer if context.tokenizer is not None else self.tokenizer,
+            tokenizer=context.tokenizer,
             image_processor=self.image_processor,
             seq_length=self.seq_length,
             task_encoder=self.task_encoder,

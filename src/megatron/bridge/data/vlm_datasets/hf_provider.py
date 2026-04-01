@@ -108,6 +108,7 @@ class HFDatasetConversationProvider(DatasetProvider):
         base_examples = maker(**kwargs)  # type: ignore[misc]
         if not isinstance(base_examples, list) or len(base_examples) == 0:
             raise ValueError(f"Maker '{self.maker_name}' returned no examples for split='{split}'")
+
         return VLMConversationDataset(
             base_examples=base_examples,
             target_length=target_length,

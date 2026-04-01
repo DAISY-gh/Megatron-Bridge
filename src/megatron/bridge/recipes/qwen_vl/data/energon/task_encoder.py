@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import bisect
-import dataclasses
 import json
 import logging
 import pickle
@@ -29,6 +28,7 @@ from megatron.energon import (
     DefaultDecoderWebdatasetFactory,
     DefaultTaskEncoder,
     Sample,
+    SkipSample,
     stateless,
 )
 from megatron.energon.epathlib import EPath
@@ -477,6 +477,9 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
         )
 
         conversation = conversation if not isinstance(conversation, dict) else conversation.get("conversations", [])
+        if not conversation:
+            logging.warning(f"Empty conversation in sample {sample.__key__}, skipping.")
+            raise SkipSample()
         _from_system_ = "from" in conversation[0]
         role_key = "from" if "from" in conversation[0] else "role"
         content_key = "value" if "from" in conversation[0] else "content"
@@ -551,15 +554,21 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
         image_token_id, video_token_id = self.image_token_id, self.video_token_id
 
         image_token_indices = np.where(input_ids == image_token_id)[0]
-        if image_token_indices is not None and image_thw_grids is not None:
-            assert len(image_token_indices) == len(image_thw_grids), (
-                f"With {len(image_thw_grids)} images in the sample, but {len(image_token_indices)} image placeholders!"
-            )
         video_token_indices = np.where(input_ids == video_token_id)[0]
-        if video_token_indices is not None and video_thw_grids is not None:
-            assert len(video_token_indices) == len(video_thw_grids), (
-                f"With {len(video_thw_grids)} videos in the sample, but {len(video_token_indices)} video placeholders!"
-            )
+
+        n_img_tokens = len(image_token_indices)
+        n_img_grids = len(image_thw_grids) if image_thw_grids is not None else 0
+        assert n_img_tokens == n_img_grids, (
+            f"Image token/data mismatch: {n_img_tokens} <image> tokens in text "
+            f"but {n_img_grids} image grid entries in visual data."
+        )
+
+        n_vid_tokens = len(video_token_indices)
+        n_vid_grids = len(video_thw_grids) if video_thw_grids is not None else 0
+        assert n_vid_tokens == n_vid_grids, (
+            f"Video token/data mismatch: {n_vid_tokens} <video> tokens in text "
+            f"but {n_vid_grids} video grid entries in visual data."
+        )
         if image_thw_grids is not None and video_thw_grids is not None:
             image_thw_grids, video_thw_grids = (
                 np.array(image_thw_grids, dtype=np.int64),
@@ -590,7 +599,10 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
             target_length = input_ids.shape[0]
 
         if target_length > self.seq_len:
-            logging.warning(f"Long sequence with length {target_length} found, dropped...")
+            logging.warning(
+                f"Long sequence with length {target_length} exceeds seq_len {self.seq_len}, skipping sample."
+            )
+            raise SkipSample()
         final_input_ids = np.zeros(target_length, dtype=input_ids.dtype)
         final_input_masks = final_input_ids.copy()
 
@@ -626,7 +638,8 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
         target[-1] = pad_token_id
 
         if (target == pad_token_id).all():
-            logging.warning("Sample with all masked label, dropped.")
+            logging.warning(f"Sample {sample.__key__} has all masked labels, skipping.")
+            raise SkipSample()
 
         image_input_mask = torch.from_numpy(final_input_ids == image_token_id)
         video_input_mask = torch.from_numpy(final_input_ids == video_token_id)
@@ -689,9 +702,9 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
 
             if len(s.imgs) > 0:
                 if isinstance(s.imgs, torch.Tensor):
-                    all_imgs.append(s.imgs.unsqueeze(0) if s.imgs.dim() == 3 else s.imgs)
-                else:
                     all_imgs.append(s.imgs)
+                elif isinstance(s.imgs, list):
+                    all_imgs.extend(t for t in s.imgs if isinstance(t, torch.Tensor))
             if len(s.image_thw_grids) > 0:
                 thw = s.image_thw_grids
                 if isinstance(thw, np.ndarray):
@@ -707,9 +720,9 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
 
             if len(s.videos) > 0:
                 if isinstance(s.videos, torch.Tensor):
-                    all_videos.append(s.videos.unsqueeze(0) if s.videos.dim() == 3 else s.videos)
-                else:
                     all_videos.append(s.videos)
+                elif isinstance(s.videos, list):
+                    all_videos.extend(t for t in s.videos if isinstance(t, torch.Tensor))
             if len(s.video_thw_grids) > 0:
                 thw = s.video_thw_grids
                 if isinstance(thw, np.ndarray):
@@ -766,7 +779,12 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
         )
 
     def _collect_visual_data(self, samples):
-        """Gather pixel_values and grid_thw from a list of samples (packed or unpacked)."""
+        """Gather pixel_values and grid_thw from a list of samples (packed or unpacked).
+
+        Qwen2.5-VL pixel_values are 2D ``[total_patches, hidden_dim]``.
+        We collect individual tensors and concatenate along dim 0 so that
+        images with different patch counts can be combined.
+        """
         imgs, image_thw_grids = [], []
         videos, video_thw_grids = [], []
 
@@ -774,29 +792,25 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
             if isinstance(s, QwenVLTaskSamplePacked):
                 for img_block in s.imgs:
                     if isinstance(img_block, torch.Tensor):
-                        imgs.append(img_block if img_block.dim() == 4 else img_block.unsqueeze(0))
+                        imgs.append(img_block)
                 for thw in s.image_thw_grids:
                     image_thw_grids.append(np.asarray(thw))
                 for vid_block in s.videos:
                     if isinstance(vid_block, torch.Tensor):
-                        videos.append(vid_block if vid_block.dim() == 4 else vid_block.unsqueeze(0))
+                        videos.append(vid_block)
                 for thw in s.video_thw_grids:
                     video_thw_grids.append(np.asarray(thw))
             else:
-                if len(s.imgs) > 0:
-                    s_imgs = s.imgs.unsqueeze(0) if isinstance(s.imgs, torch.Tensor) and s.imgs.dim() == 3 else s.imgs
-                    if isinstance(s_imgs, torch.Tensor):
-                        imgs.append(s_imgs)
+                if len(s.imgs) > 0 and isinstance(s.imgs, torch.Tensor):
+                    imgs.append(s.imgs)
                 if len(s.image_thw_grids) > 0:
                     if isinstance(s.image_thw_grids, np.ndarray):
                         for row in s.image_thw_grids:
                             image_thw_grids.append(row)
                     else:
                         image_thw_grids.extend(s.image_thw_grids)
-                if len(s.videos) > 0:
-                    s_vids = s.videos.unsqueeze(0) if isinstance(s.videos, torch.Tensor) and s.videos.dim() == 3 else s.videos
-                    if isinstance(s_vids, torch.Tensor):
-                        videos.append(s_vids)
+                if len(s.videos) > 0 and isinstance(s.videos, torch.Tensor):
+                    videos.append(s.videos)
                 if len(s.video_thw_grids) > 0:
                     if isinstance(s.video_thw_grids, np.ndarray):
                         for row in s.video_thw_grids:
@@ -881,8 +895,8 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
             batch_obj = QwenVLTaskBatch(
                 __keys__=[s.__key__ for s in samples],
                 __subflavors__=[s.__subflavors__ for s in samples],
-                pixel_values=torch.vstack(imgs) if len(imgs) > 0 else None,
-                pixel_values_videos=torch.vstack(videos) if len(videos) > 0 else None,
+                pixel_values=torch.cat(imgs, dim=0) if len(imgs) > 0 else None,
+                pixel_values_videos=torch.cat(videos, dim=0) if len(videos) > 0 else None,
                 image_grid_thw=torch.from_numpy(np.array(image_thw_grids)) if len(image_thw_grids) > 0 else None,
                 video_grid_thw=torch.from_numpy(np.array(video_thw_grids)) if len(video_thw_grids) > 0 else None,
                 image_input_mask=torch.from_numpy(image_input_masks),
@@ -938,8 +952,8 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
         batch_obj = QwenVLTaskBatch(
             __keys__=[s.__key__ for s in samples],
             __subflavors__=[s.__subflavors__ for s in samples],
-            pixel_values=torch.vstack(imgs) if len(imgs) > 0 else None,
-            pixel_values_videos=torch.vstack(videos) if len(videos) > 0 else None,
+            pixel_values=torch.cat(imgs, dim=0) if len(imgs) > 0 else None,
+            pixel_values_videos=torch.cat(videos, dim=0) if len(videos) > 0 else None,
             image_grid_thw=torch.from_numpy(np.array(image_thw_grids)) if len(image_thw_grids) > 0 else None,
             video_grid_thw=torch.from_numpy(np.array(video_thw_grids)) if len(video_thw_grids) > 0 else None,
             image_input_mask=torch.from_numpy(image_input_masks),
@@ -954,14 +968,28 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
 
     @stateless
     def encode_batch(self, batch: QwenVLTaskBatch) -> dict:
-        """Encode batch in dict"""
+        """Encode batch in dict.
 
-        raw = dataclasses.asdict(batch)
-        del raw["__subflavors__"]
+        Builds the output dict manually instead of ``dataclasses.asdict`` to
+        avoid deep-copying large visual tensors that would be discarded by the
+        downstream ``get_batch_from_iterator`` anyway.
+        """
+        raw: dict = {
+            "__keys__": batch.__keys__,
+            "input_ids": batch.input_ids,
+            "attention_mask": batch.attention_mask,
+            "position_ids": batch.position_ids,
+            "labels": batch.labels,
+            "loss_mask": batch.loss_mask,
+            "image_input_mask": batch.image_input_mask,
+            "video_input_mask": batch.video_input_mask,
+        }
 
         raw["visual_inputs"] = Qwen2_5_VLVisualInputs(
             pixel_values=batch.pixel_values,
             image_grid_thw=batch.image_grid_thw,
+            pixel_values_videos=batch.pixel_values_videos,
+            video_grid_thw=batch.video_grid_thw,
         )
 
         if batch.cu_lengths is not None:

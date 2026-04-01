@@ -28,11 +28,10 @@ class Qwen2_5_VLVisualInputs:
     normalized for model consumption via normalized_for_model().
     """
 
-    # Image tensors, e.g., Qwen2.5-VL processor output.
     pixel_values: Optional[torch.Tensor] = None
-
-    # Per-image temporal/spatial grid metadata (T, H, W) for videos, Qwen2.5-VL.
     image_grid_thw: Optional[torch.Tensor] = None
+    pixel_values_videos: Optional[torch.Tensor] = None
+    video_grid_thw: Optional[torch.Tensor] = None
 
     def as_model_kwargs(self) -> dict[str, torch.Tensor]:
         """Return a mapping of non-None fields suitable for model forward kwargs."""
@@ -46,18 +45,21 @@ class Qwen2_5_VLVisualInputs:
     def normalized_for_model(self) -> dict[str, torch.Tensor]:
         """Return non-None fields with shapes normalized for model expectations.
 
-        - pixel_values: [B, N, C, H, W] -> [B*N, C, H, W]
-        - image_grid_thw: [B, N, 3] -> [B*N, 3]
+        Flattens batch dimensions for tensors that have them:
+        - pixel_values / pixel_values_videos: [B, N, C, H, W] -> [B*N, C, H, W]
+        - image_grid_thw / video_grid_thw: [B, N, 3] -> [B*N, 3]
         """
         kwargs = self.as_model_kwargs()
 
-        pixel_values = kwargs.get("pixel_values")
-        if isinstance(pixel_values, torch.Tensor) and pixel_values.dim() == 5:
-            b, n, c, h, w = pixel_values.shape
-            kwargs["pixel_values"] = pixel_values.view(b * n, c, h, w)
+        for pv_key in ("pixel_values", "pixel_values_videos"):
+            pv = kwargs.get(pv_key)
+            if isinstance(pv, torch.Tensor) and pv.dim() == 5:
+                b, n, c, h, w = pv.shape
+                kwargs[pv_key] = pv.view(b * n, c, h, w)
 
-        image_grid_thw = kwargs.get("image_grid_thw")
-        if isinstance(image_grid_thw, torch.Tensor) and image_grid_thw.dim() == 3:
-            kwargs["image_grid_thw"] = image_grid_thw.view(-1, image_grid_thw.size(-1))
+        for thw_key in ("image_grid_thw", "video_grid_thw"):
+            thw = kwargs.get(thw_key)
+            if isinstance(thw, torch.Tensor) and thw.dim() == 3:
+                kwargs[thw_key] = thw.view(-1, thw.size(-1))
 
         return kwargs

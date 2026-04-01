@@ -38,6 +38,73 @@ from megatron.bridge.training.utils.pg_utils import get_pg_collection
 logger = logging.getLogger(__name__)
 
 
+def _unpack_energon_batch(
+    tokens: torch.Tensor,
+    labels: torch.Tensor | None,
+    loss_mask: torch.Tensor | None,
+    attention_mask: torch.Tensor | None,
+    position_ids: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_argmin: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    """Unpack an Energon pre-packed batch into individual sub-samples.
+
+    Energon packing produces ``[batch_size, packed_len]`` with ``cu_seqlens``
+    marking sub-sample boundaries.  Qwen3-VL needs each sub-sample as a
+    separate batch row (BSHD) for per-row MRoPE computation.  This helper
+    splits the packed sequences back to ``[N_subs, max_sub_len]`` with padding.
+    """
+    device = tokens.device
+    pad_value_tokens = 0
+    pad_value_labels = -100
+
+    all_tokens, all_labels, all_loss, all_pos = [], [], [], []
+    batch_size = tokens.shape[0]
+
+    for b in range(batch_size):
+        if cu_seqlens.dim() == 2:
+            n_valid = int(cu_seqlens_argmin[b].item()) if cu_seqlens_argmin is not None else cu_seqlens.shape[1]
+            cu = cu_seqlens[b, :n_valid].cpu()
+        else:
+            cu = cu_seqlens.cpu()
+
+        n_subs = len(cu) - 1
+        for i in range(n_subs):
+            start, end = int(cu[i].item()), int(cu[i + 1].item())
+            if start >= end:
+                continue
+            all_tokens.append(tokens[b, start:end])
+            if labels is not None:
+                all_labels.append(labels[b, start:end])
+            if loss_mask is not None:
+                all_loss.append(loss_mask[b, start:end])
+            if position_ids is not None:
+                all_pos.append(position_ids[b, start:end])
+
+    if not all_tokens:
+        return tokens, labels, loss_mask, attention_mask, position_ids
+
+    max_sub_len = max(t.shape[0] for t in all_tokens)
+    n = len(all_tokens)
+
+    def _pad_stack(tensors: list[torch.Tensor], pad_val) -> torch.Tensor:
+        out = torch.full((n, max_sub_len), pad_val, dtype=tensors[0].dtype, device=device)
+        for i, t in enumerate(tensors):
+            out[i, : t.shape[0]] = t
+        return out
+
+    unpacked_tokens = _pad_stack(all_tokens, pad_value_tokens)
+    unpacked_labels = _pad_stack(all_labels, pad_value_labels) if all_labels else None
+    unpacked_loss = _pad_stack(all_loss, 0) if all_loss else None
+    unpacked_pos = _pad_stack(all_pos, 0) if all_pos else None
+
+    logger.debug(
+        f"[EnergonUnpack] unpacked {batch_size} packed rows → {n} sub-samples, max_sub_len={max_sub_len}"
+    )
+
+    return unpacked_tokens, unpacked_labels, unpacked_loss, None, unpacked_pos
+
+
 def get_batch_from_iterator(
     data_iterator: Iterable,
     use_mtp: bool = False,
@@ -133,22 +200,26 @@ def get_batch(
         is_last_pp_stage=is_last_pp_stage,
     )
 
+    tokens = batch.get("tokens") if batch.get("tokens") is not None else batch.get("input_ids")
+    labels = batch.get("labels")
+    loss_mask = batch.get("loss_mask")
+    attention_mask = batch.get("attention_mask")
+    position_ids = batch.get("position_ids")
+
+    energon_cu_seqlens = batch.get("cu_seqlens")
+    if energon_cu_seqlens is not None:
+        tokens, labels, loss_mask, attention_mask, position_ids = _unpack_energon_batch(
+            tokens, labels, loss_mask, attention_mask, position_ids,
+            cu_seqlens=energon_cu_seqlens,
+            cu_seqlens_argmin=batch.get("cu_seqlens_argmin"),
+        )
+
     if "visual_inputs" in batch and batch.get("visual_inputs") is not None:
-        # convert visual_inputs to multi_modal_inputs which is a dict contains "pixel_values" and "image_grid_thw"
-        # TODO(jinliangl): add video support
         multi_modal_inputs = batch.get("visual_inputs").normalized_for_model()
     else:
         multi_modal_inputs = {}
 
-    # return naive batch and don't do any padding or cp slicing
-    return (
-        batch.get("tokens") if batch.get("tokens") is not None else batch.get("input_ids"),
-        batch.get("labels"),
-        batch.get("loss_mask"),
-        batch.get("attention_mask"),
-        batch.get("position_ids"),
-        multi_modal_inputs,
-    )
+    return (tokens, labels, loss_mask, attention_mask, position_ids, multi_modal_inputs)
 
 
 def pack_or_pad_batch_sequences(
