@@ -462,51 +462,81 @@ def forward_step(
             state._thd_force_bshd_logged = True
     elif cu_seqlens is not None:
         physical_seq_len = tokens.shape[-1]
-
-        # Determine the number of valid entries in cu_seqlens.
-        cu = cu_seqlens.squeeze()
-        if cu_seqlens_argmin is not None:
-            n_valid = int(cu_seqlens_argmin.item())
-        elif cu.dim() == 1:
-            n_valid = len(cu)
-        else:
-            n_valid = int(torch.argmin(cu).item())
-
-        cu_clean = cu[:n_valid]
-        last_boundary = int(cu_clean[-1].item())
-
-        if last_boundary < physical_seq_len:
-            # Trailing padding exists: extend the last real segment's padded
-            # boundary to cover the tail so that all layers (TE attention, GDN,
-            # etc.) see the same sequence boundaries.  We intentionally do NOT
-            # set cu_seqlens_unpadded here so that cu_seqlens_q_padded stays
-            # None — this forces every layer to treat pad tokens identically to
-            # real tokens, avoiding undefined attention output at pad positions
-            # that would otherwise propagate NaN through subsequent layers and
-            # into the backward pass.  loss_mask already zeros pad positions.
-            cu_padded = cu_clean.clone()
-            cu_padded[-1] = physical_seq_len
-
-            padded_diffs = cu_padded[1:] - cu_padded[:-1]
-            max_seqlen_padded = padded_diffs.max()
-
+        force_single_segment_cu = os.environ.get("THD_FORCE_SINGLE_SEGMENT_CU", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if force_single_segment_cu:
+            cu_single = torch.tensor([0, physical_seq_len], dtype=torch.int32, device=tokens.device)
             packed_seq_dict = {
-                "cu_seqlens": cu_padded,
-                "cu_seqlens_argmin": torch.tensor(n_valid),
-                "max_seqlen": max_seqlen_padded,
+                "cu_seqlens": cu_single,
+                "cu_seqlens_argmin": torch.tensor(2),
+                "max_seqlen": torch.tensor(physical_seq_len),
             }
+            forward_args["packed_seq_params"] = get_packed_seq_params(packed_seq_dict)
+            if not getattr(state, "_thd_single_segment_cu_logged", False):
+                rank = (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_available() and torch.distributed.is_initialized()
+                    else 0
+                )
+                if rank == 0:
+                    logger.info(
+                        "THD_FORCE_SINGLE_SEGMENT_CU is enabled: override packed_seq_params with cu=[0, %d].",
+                        physical_seq_len,
+                    )
+                state._thd_single_segment_cu_logged = True
+            # Keep THD path enabled but with synthetic single-segment boundaries.
+            cu_seqlens = None
+            max_seqlen = None
         else:
-            # No trailing padding (content fills the full sequence length).
-            packed_seq_dict = {
-                "cu_seqlens": cu_seqlens,
-                "max_seqlen": max_seqlen,
-            }
+
+            # Determine the number of valid entries in cu_seqlens.
+            cu = cu_seqlens.squeeze()
             if cu_seqlens_argmin is not None:
-                packed_seq_dict["cu_seqlens_argmin"] = cu_seqlens_argmin
-            elif cu_seqlens.dim() == 1:
-                packed_seq_dict["cu_seqlens_argmin"] = torch.tensor(len(cu_seqlens))
+                n_valid = int(cu_seqlens_argmin.item())
+            elif cu.dim() == 1:
+                n_valid = len(cu)
+            else:
+                n_valid = int(torch.argmin(cu).item())
 
-        forward_args["packed_seq_params"] = get_packed_seq_params(packed_seq_dict)
+            cu_clean = cu[:n_valid]
+            last_boundary = int(cu_clean[-1].item())
+
+            if last_boundary < physical_seq_len:
+                # Trailing padding exists: extend the last real segment's padded
+                # boundary to cover the tail so that all layers (TE attention, GDN,
+                # etc.) see the same sequence boundaries.  We intentionally do NOT
+                # set cu_seqlens_unpadded here so that cu_seqlens_q_padded stays
+                # None — this forces every layer to treat pad tokens identically to
+                # real tokens, avoiding undefined attention output at pad positions
+                # that would otherwise propagate NaN through subsequent layers and
+                # into the backward pass.  loss_mask already zeros pad positions.
+                cu_padded = cu_clean.clone()
+                cu_padded[-1] = physical_seq_len
+
+                padded_diffs = cu_padded[1:] - cu_padded[:-1]
+                max_seqlen_padded = padded_diffs.max()
+
+                packed_seq_dict = {
+                    "cu_seqlens": cu_padded,
+                    "cu_seqlens_argmin": torch.tensor(n_valid),
+                    "max_seqlen": max_seqlen_padded,
+                }
+            else:
+                # No trailing padding (content fills the full sequence length).
+                packed_seq_dict = {
+                    "cu_seqlens": cu_seqlens,
+                    "max_seqlen": max_seqlen,
+                }
+                if cu_seqlens_argmin is not None:
+                    packed_seq_dict["cu_seqlens_argmin"] = cu_seqlens_argmin
+                elif cu_seqlens.dim() == 1:
+                    packed_seq_dict["cu_seqlens_argmin"] = torch.tensor(len(cu_seqlens))
+
+            forward_args["packed_seq_params"] = get_packed_seq_params(packed_seq_dict)
 
     check_for_nan_in_loss = state.cfg.rerun_state_machine.check_for_nan_in_loss
     check_for_spiky_loss = state.cfg.rerun_state_machine.check_for_spiky_loss
