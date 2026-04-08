@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 from typing import Optional
 
 import torch
@@ -47,6 +49,9 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
     split_deepstack_embs,
 )
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.vision_model import Qwen3VLVisionModel
+
+
+logger = logging.getLogger(__name__)
 
 
 class Qwen3VLModel(MegatronModule):
@@ -516,18 +521,36 @@ class Qwen3VLModel(MegatronModule):
                     sl_int = int(sl)
                     packed_pos[:, 0, start : start + sl_int] = position_ids[:, i, :sl_int]
 
-                position_ids = packed_pos
-
-                position_ids = (
-                    preprocess_packed_seqs(
-                        position_ids.permute(1, 2, 0),
-                        attention_mask,
-                        pre_process=True,
-                        pg_collection=self.pg_collection,
-                    )[0]
-                    .permute(2, 0, 1)
-                    .contiguous()
+                skip_preprocess = os.environ.get("THD_SKIP_PREPROCESS_PACKED_POS", "0").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
                 )
+                position_ids = packed_pos
+                if skip_preprocess:
+                    if not getattr(self, "_thd_skip_preprocess_logged", False):
+                        rank = (
+                            torch.distributed.get_rank()
+                            if torch.distributed.is_available() and torch.distributed.is_initialized()
+                            else 0
+                        )
+                        if rank == 0:
+                            logger.info(
+                                "THD_SKIP_PREPROCESS_PACKED_POS is enabled: skip preprocess_packed_seqs(position_ids)."
+                            )
+                        self._thd_skip_preprocess_logged = True
+                else:
+                    position_ids = (
+                        preprocess_packed_seqs(
+                            position_ids.permute(1, 2, 0),
+                            attention_mask,
+                            pre_process=True,
+                            pg_collection=self.pg_collection,
+                        )[0]
+                        .permute(2, 0, 1)
+                        .contiguous()
+                    )
                 attention_mask = None
                 self.language_model.rotary_pos_emb.is_thd_format = True
             else:
