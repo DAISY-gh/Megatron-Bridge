@@ -54,6 +54,14 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.vision_model import Qwen3
 logger = logging.getLogger(__name__)
 
 
+def _thd_diag_enabled() -> bool:
+    return os.environ.get("THD_DIAG", "0").lower() in ("1", "true", "yes", "on")
+
+
+def _rank0() -> bool:
+    return not torch.distributed.is_available() or not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+
 class Qwen3VLModel(MegatronModule):
     """Qwen3VL multi-modal model.
 
@@ -565,6 +573,53 @@ class Qwen3VLModel(MegatronModule):
                     video_grid_thw=video_grid_thw,
                     attention_mask=attention_mask,
                 )  #  [3*b*s]
+
+        if _thd_diag_enabled() and _rank0():
+            diag_step = int(getattr(getattr(self, "train_state", None), "step", -1))
+            # train_state is managed outside this module in most paths; keep fallback
+            # and use a local capped counter to avoid log spam.
+            diag_count = int(getattr(self, "_thd_diag_count", 0))
+            if diag_count < 3:
+                setattr(self, "_thd_diag_count", diag_count + 1)
+                psp_enabled = packed_seq_params is not None
+                rotary_is_thd = getattr(self.language_model.rotary_pos_emb, "is_thd_format", None)
+                logger.info(
+                    "[THD_DIAG][model] call=%d step=%d packed=%s input_ids=%s lm_input_ids=%s position_ids=%s attention_mask=%s rotary.is_thd_format=%s",
+                    diag_count,
+                    diag_step,
+                    str(psp_enabled),
+                    str(tuple(input_ids.shape)) if input_ids is not None else "None",
+                    str(tuple(lm_input_ids.shape)) if lm_input_ids is not None else "None",
+                    str(tuple(position_ids.shape)) if position_ids is not None else "None",
+                    "None" if attention_mask is None else str(tuple(attention_mask.shape)),
+                    str(rotary_is_thd),
+                )
+                if position_ids is not None:
+                    pos_min = int(position_ids.min().item())
+                    pos_max = int(position_ids.max().item())
+                    sample = (
+                        position_ids[:, 0, :8].detach().cpu().tolist()
+                        if position_ids.dim() == 3 and position_ids.shape[1] > 0
+                        else []
+                    )
+                    logger.info(
+                        "[THD_DIAG][model] position_ids range=[%d, %d], sample(first-8)=%s",
+                        pos_min,
+                        pos_max,
+                        sample,
+                    )
+                if psp_enabled and attention_mask is not None:
+                    logger.error(
+                        "[THD_DIAG][model] packed_seq_params is set but attention_mask is not None before language_model."
+                    )
+                if psp_enabled and rotary_is_thd is not True:
+                    logger.error(
+                        "[THD_DIAG][model] packed_seq_params is set but rotary_pos_emb.is_thd_format is not True."
+                    )
+                if (not psp_enabled) and rotary_is_thd is True:
+                    logger.warning(
+                        "[THD_DIAG][model] packed_seq_params is None but rotary_pos_emb.is_thd_format is still True (state carry-over?)."
+                    )
 
         torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_push("Qwen3VLModel.forward.language_model")

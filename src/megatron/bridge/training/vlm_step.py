@@ -39,6 +39,14 @@ from megatron.bridge.training.utils.pg_utils import get_pg_collection
 logger = logging.getLogger(__name__)
 
 
+def _thd_diag_enabled() -> bool:
+    return os.environ.get("THD_DIAG", "0").lower() in ("1", "true", "yes", "on")
+
+
+def _rank0() -> bool:
+    return not torch.distributed.is_available() or not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+
 def get_batch_from_iterator(
     data_iterator: Iterable,
     use_mtp: bool = False,
@@ -537,6 +545,50 @@ def forward_step(
                     packed_seq_dict["cu_seqlens_argmin"] = torch.tensor(len(cu_seqlens))
 
             forward_args["packed_seq_params"] = get_packed_seq_params(packed_seq_dict)
+
+    if _thd_diag_enabled() and _rank0() and "packed_seq_params" in forward_args:
+        # Only print detailed diagnostics for the first few steps to keep logs readable.
+        diag_step = int(getattr(getattr(state, "train_state", None), "step", -1))
+        if diag_step < 3:
+            psp = forward_args["packed_seq_params"]
+            cu_q = getattr(psp, "cu_seqlens_q", None)
+            max_q = getattr(psp, "max_seqlen_q", None)
+            cu_summary = "None"
+            cu_ok = True
+            if cu_q is not None:
+                cu_flat = cu_q.squeeze()
+                cu_cpu = cu_flat.detach().cpu()
+                cu_list = cu_cpu.tolist() if cu_cpu.numel() <= 20 else (cu_cpu[:20].tolist() + ["..."])
+                total_len = int(tokens.shape[-1])
+                monotonic = bool(torch.all(cu_cpu[1:] >= cu_cpu[:-1]).item()) if cu_cpu.numel() > 1 else True
+                starts_zero = int(cu_cpu[0].item()) == 0 if cu_cpu.numel() > 0 else False
+                ends_match = int(cu_cpu[-1].item()) == total_len if cu_cpu.numel() > 0 else False
+                cu_ok = monotonic and starts_zero and ends_match
+                cu_summary = (
+                    f"len={int(cu_cpu.numel())}, sample={cu_list}, monotonic={monotonic}, "
+                    f"starts_zero={starts_zero}, ends_match_tokens={ends_match}, tokens_len={total_len}"
+                )
+            logger.info(
+                "[THD_DIAG][vlm_step] step=%d packed_seq_params: qkv_format=%s, max_seqlen_q=%s, cu_q=%s",
+                diag_step,
+                str(getattr(psp, "qkv_format", None)),
+                str(max_q),
+                cu_summary,
+            )
+            logger.info(
+                "[THD_DIAG][vlm_step] step=%d tensors: tokens=%s labels=%s loss_mask=%s attention_mask=%s model_position_ids=%s",
+                diag_step,
+                str(tuple(tokens.shape)) if tokens is not None else "None",
+                str(tuple(labels.shape)) if labels is not None else "None",
+                str(tuple(loss_mask.shape)) if loss_mask is not None else "None",
+                "None" if attention_mask is None else str(tuple(attention_mask.shape)),
+                "None" if model_position_ids is None else str(tuple(model_position_ids.shape)),
+            )
+            if not cu_ok:
+                logger.error(
+                    "[THD_DIAG][vlm_step] step=%d packed cu_seqlens contract failed; investigate cu construction vs token layout.",
+                    diag_step,
+                )
 
     check_for_nan_in_loss = state.cfg.rerun_state_machine.check_for_nan_in_loss
     check_for_spiky_loss = state.cfg.rerun_state_machine.check_for_spiky_loss
