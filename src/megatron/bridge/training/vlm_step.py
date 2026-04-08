@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 from functools import partial
 from typing import Any, Iterable
 
@@ -452,7 +453,14 @@ def forward_step(
         forward_args.update(visual_inputs.normalized_for_model())
 
     # Add packed sequence support
-    if cu_seqlens is not None:
+    force_bshd_for_thd = os.environ.get("THD_FORCE_BSHD", "0").lower() in ("1", "true", "yes", "on")
+    if cu_seqlens is not None and force_bshd_for_thd:
+        if not getattr(state, "_thd_force_bshd_logged", False):
+            logger.info(
+                "THD_FORCE_BSHD is enabled: skip packed_seq_params and run Energon batch through non-THD model path."
+            )
+            state._thd_force_bshd_logged = True
+    elif cu_seqlens is not None:
         physical_seq_len = tokens.shape[-1]
 
         # Determine the number of valid entries in cu_seqlens.
