@@ -584,6 +584,31 @@ def forward_step(
                 "None" if attention_mask is None else str(tuple(attention_mask.shape)),
                 "None" if model_position_ids is None else str(tuple(model_position_ids.shape)),
             )
+            # Token-accounting diagnostics for THD-vs-BSHD parity checks:
+            # 1) which tokens contribute to LM loss (loss_mask>0),
+            # 2) how many explicit pad tokens exist in decoder input,
+            # 3) whether cu_seqlens content length matches the packed tensor length.
+            if tokens is not None and loss_mask is not None:
+                flat_tokens = tokens.view(-1)
+                flat_loss_mask = loss_mask.view(-1)
+                valid_loss_tokens = int((flat_loss_mask > 0).sum().item())
+                total_tokens = int(flat_tokens.numel())
+                pad_tokens = int((flat_tokens == 0).sum().item())
+                logger.info(
+                    "[THD_DIAG][vlm_step] step=%d token_accounting: total_tokens=%d valid_loss_tokens=%d pad_token_id0=%d",
+                    diag_step,
+                    total_tokens,
+                    valid_loss_tokens,
+                    pad_tokens,
+                )
+                if cu_q is not None and cu_q.numel() > 0:
+                    cu_last = int(cu_q.view(-1)[-1].item())
+                    logger.info(
+                        "[THD_DIAG][vlm_step] step=%d packed_content_len_from_cu=%d packed_tensor_len=%d",
+                        diag_step,
+                        cu_last,
+                        int(tokens.shape[-1]),
+                    )
             if not cu_ok:
                 logger.error(
                     "[THD_DIAG][vlm_step] step=%d packed cu_seqlens contract failed; investigate cu construction vs token layout.",
