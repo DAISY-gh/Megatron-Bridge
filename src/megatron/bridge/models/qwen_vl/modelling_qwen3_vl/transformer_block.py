@@ -479,6 +479,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
         rotary_pos_emb: Tensor,
         attention_bias: Tensor,
         packed_seq_params: PackedSeqParams,
+        padding_mask: Optional[Tensor],
         use_inner_fp8_context: bool,
         # args for deepstack
         visual_pos_masks: Optional[torch.Tensor] = None,
@@ -493,6 +494,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
                 context,
                 context_mask,
                 rotary_pos_emb,
+                padding_mask,
                 visual_pos_masks,
                 *deepstack_visual_embeds_args,
             ):
@@ -514,6 +516,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
                             attention_bias=attention_bias,
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
+                            padding_mask=padding_mask,
                         )
 
                         if self.pre_process and deepstack_visual_embeds is not None:
@@ -543,6 +546,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
                     context,
                     context_mask,
                     rotary_pos_emb,
+                    padding_mask,
                     visual_pos_masks,
                     *deepstack_visual_embeds_tuple,
                 )
@@ -555,6 +559,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
                     context,
                     context_mask,
                     rotary_pos_emb,
+                    padding_mask,
                     visual_pos_masks,
                     *deepstack_visual_embeds_tuple,
                 )
@@ -594,6 +599,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
                         context,
                         context_mask,
                         rotary_pos_emb,
+                        padding_mask,
                         visual_pos_masks,
                         *deepstack_visual_embeds_tuple,
                     )
@@ -615,6 +621,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         # args for deepstack
@@ -706,6 +713,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
                     rotary_pos_emb=rotary_pos_emb,
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
                     use_inner_fp8_context=use_inner_fp8_context,
                     visual_pos_masks=visual_pos_masks,
                     deepstack_visual_embeds=deepstack_visual_embeds,
@@ -730,6 +738,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
                             inference_context=inference_context,
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
+                            padding_mask=padding_mask,
                         )
 
                         if self.pre_process and deepstack_visual_embeds is not None:
