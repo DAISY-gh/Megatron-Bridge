@@ -667,6 +667,10 @@ def preprocess_packed_seqs(
     See https://github.com/NVIDIA/TransformerEngine/issues/1368
     """
     batch_size = input_ids.shape[0]
+    # Callers may pass int/long 0/1 masks. Ensure boolean masking semantics for
+    # tensor indexing (`input_ids[i, attention_mask[i]]`) below.
+    if attention_mask.dtype != torch.bool:
+        attention_mask = attention_mask != 0
 
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     if pg_collection is not None:

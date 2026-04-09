@@ -400,7 +400,7 @@ class Qwen3VLModel(MegatronModule):
                 combined_embeddings = split_data_cp_rank(combined_embeddings, cp_size, 0, cp_rank)
             if packed_seq_params is not None:
                 if attention_mask is None:
-                    attention_mask = torch.ones_like(input_ids, dtype=torch.int32, device=input_ids.device)
+                    attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
                 input_ids_thd, _ = preprocess_packed_seqs(
                     input_ids, attention_mask, pre_process=True, pg_collection=self.pg_collection
                 )
@@ -456,7 +456,7 @@ class Qwen3VLModel(MegatronModule):
             # convert lm_input_ids to THD format so it matches position_ids.
             if packed_seq_params is not None:
                 if attention_mask is None:
-                    attention_mask = torch.ones_like(input_ids, dtype=torch.int32, device=input_ids.device)
+                    attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
                 lm_input_ids, _ = preprocess_packed_seqs(
                     input_ids, attention_mask, pre_process=True, pg_collection=self.pg_collection
                 )
@@ -528,6 +528,16 @@ class Qwen3VLModel(MegatronModule):
                     start = int(cu[i].item())
                     sl_int = int(sl)
                     packed_pos[:, 0, start : start + sl_int] = position_ids[:, i, :sl_int]
+                if _thd_diag_enabled() and _rank0():
+                    pre_min = int(packed_pos.min().item())
+                    pre_max = int(packed_pos.max().item())
+                    pre_sample = packed_pos[:, 0, :8].detach().cpu().tolist()
+                    logger.info(
+                        "[THD_DIAG][model] packed_pos(before preprocess) range=[%d, %d], sample(first-8)=%s",
+                        pre_min,
+                        pre_max,
+                        pre_sample,
+                    )
 
                 skip_preprocess = os.environ.get("THD_SKIP_PREPROCESS_PACKED_POS", "0").lower() in (
                     "1",
@@ -559,6 +569,16 @@ class Qwen3VLModel(MegatronModule):
                         .permute(2, 0, 1)
                         .contiguous()
                     )
+                    if _thd_diag_enabled() and _rank0():
+                        post_min = int(position_ids.min().item())
+                        post_max = int(position_ids.max().item())
+                        post_sample = position_ids[:, 0, :8].detach().cpu().tolist()
+                        logger.info(
+                            "[THD_DIAG][model] position_ids(after preprocess) range=[%d, %d], sample(first-8)=%s",
+                            post_min,
+                            post_max,
+                            post_sample,
+                        )
                 attention_mask = None
                 self.language_model.rotary_pos_emb.is_thd_format = True
             else:
