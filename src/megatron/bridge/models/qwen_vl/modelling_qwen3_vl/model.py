@@ -424,9 +424,10 @@ class Qwen3VLModel(MegatronModule):
                 )
                 lm_input_ids = input_ids_thd
                 if moe_padding_mask_for_lm is not None:
+                    attn_mask_bool = attention_mask.bool()
                     moe_padding_mask_for_lm = preprocess_packed_seqs(
                         moe_padding_mask_for_lm.to(dtype=torch.int32),
-                        attention_mask,
+                        attn_mask_bool,
                         pre_process=True,
                         pg_collection=self.pg_collection,
                     )[0].bool()
@@ -486,9 +487,10 @@ class Qwen3VLModel(MegatronModule):
                     input_ids, attention_mask, pre_process=True, pg_collection=self.pg_collection
                 )
                 if moe_padding_mask_for_lm is not None:
+                    attn_mask_bool = attention_mask.bool()
                     moe_padding_mask_for_lm = preprocess_packed_seqs(
                         moe_padding_mask_for_lm.to(dtype=torch.int32),
-                        attention_mask,
+                        attn_mask_bool,
                         pre_process=True,
                         pg_collection=self.pg_collection,
                     )[0].bool()
