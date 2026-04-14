@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import logging
-import os
 from typing import Optional
 
 import torch
@@ -52,24 +51,6 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.vision_model import Qwen3
 
 
 logger = logging.getLogger(__name__)
-
-
-def _thd_diag_enabled() -> bool:
-    return os.environ.get("THD_DIAG", "0") not in ("0", "", "false", "False")
-
-
-def _thd_diag_align_enabled() -> bool:
-    return os.environ.get("THD_DIAG_ALIGN", "0") not in ("0", "", "false", "False")
-
-
-def _thd_diag_mrope_enabled() -> bool:
-    return os.environ.get("THD_DIAG_MROPE", "0") not in ("0", "", "false", "False")
-
-
-def _rank0() -> bool:
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return True
-    return torch.distributed.get_rank() == 0
 
 
 class Qwen3VLModel(MegatronModule):
@@ -344,18 +325,6 @@ class Qwen3VLModel(MegatronModule):
         lm_input_ids = input_ids
         moe_padding_mask_for_lm = moe_padding_mask
 
-        def _mask_summary(mask: torch.Tensor, max_items: int = 8) -> tuple[int, str]:
-            flat_idx = torch.nonzero(mask.reshape(-1), as_tuple=False).view(-1)
-            count = int(flat_idx.numel())
-            if count == 0:
-                return count, "[]"
-            head = flat_idx[:max_items].tolist()
-            tail = flat_idx[-max_items:].tolist() if count > max_items else []
-            summary = f"head={head}"
-            if tail:
-                summary += f", tail={tail}"
-            return count, summary
-
         if self.pre_process:
             # can reorganize_inputs at dataset
             vision_data, vision_grid_thw, vision_mask = reorganize_inputs(
@@ -451,53 +420,6 @@ class Qwen3VLModel(MegatronModule):
                         pre_process=True,
                         pg_collection=self.pg_collection,
                     )[0].bool()
-                if (
-                    _thd_diag_align_enabled()
-                    and _rank0()
-                    and labels is not None
-                    and loss_mask is not None
-                ):
-                    labels_thd = preprocess_packed_seqs(
-                        labels,
-                        attn_mask_bool,
-                        pre_process=True,
-                        pg_collection=self.pg_collection,
-                    )[0]
-                    loss_mask_thd = preprocess_packed_seqs(
-                        loss_mask.to(dtype=torch.float32),
-                        attn_mask_bool,
-                        pre_process=True,
-                        pg_collection=self.pg_collection,
-                    )[0]
-                    labels_valid_pre = labels.ne(-100)
-                    labels_valid_post = labels_thd.ne(-100)
-                    loss_valid_pre = loss_mask > 0
-                    loss_valid_post = loss_mask_thd > 0
-                    label_pre_cnt, label_pre_idx = _mask_summary(labels_valid_pre)
-                    label_post_cnt, label_post_idx = _mask_summary(labels_valid_post)
-                    loss_pre_cnt, loss_pre_idx = _mask_summary(loss_valid_pre)
-                    loss_post_cnt, loss_post_idx = _mask_summary(loss_valid_post)
-                    logger.info(
-                        "[THD_DIAG][align] labels_pre_count=%d labels_post_count=%d labels_same=%s labels_pre_%s labels_post_%s",
-                        label_pre_cnt,
-                        label_post_cnt,
-                        str(bool(torch.equal(labels_valid_pre, labels_valid_post))),
-                        label_pre_idx,
-                        label_post_idx,
-                    )
-                    logger.info(
-                        "[THD_DIAG][align] loss_pre_count=%d loss_post_count=%d loss_same=%s loss_pre_%s loss_post_%s",
-                        loss_pre_cnt,
-                        loss_post_cnt,
-                        str(bool(torch.equal(loss_valid_pre, loss_valid_post))),
-                        loss_pre_idx,
-                        loss_post_idx,
-                    )
-                    logger.info(
-                        "[THD_DIAG][align] pre_label_loss_same=%s post_label_loss_same=%s",
-                        str(bool(torch.equal(labels_valid_pre, loss_valid_pre))),
-                        str(bool(torch.equal(labels_valid_post, loss_valid_post))),
-                    )
                 _, _, vision_mask_thd = reorganize_inputs(
                     input_ids=input_ids_thd,
                     pixel_values=pixel_values,
@@ -630,32 +552,6 @@ class Qwen3VLModel(MegatronModule):
                     sl_int = int(sl)
                     packed_pos[:, 0, start : start + sl_int] = position_ids[:, i, :sl_int]
 
-                if _thd_diag_mrope_enabled() and _rank0():
-                    # Summarize per-subsequence MRoPE position behavior before THD remap.
-                    # This is diagnostics-only and intentionally does not affect semantics.
-                    show_n = 4
-                    head_stats = []
-                    for i, sl in enumerate(seq_lens[:show_n]):
-                        start = int(cu[i].item())
-                        sl_int = int(sl)
-                        if sl_int <= 0:
-                            head_stats.append(f"{i}:len=0")
-                            continue
-                        pos0 = packed_pos[0, 0, start : start + sl_int]
-                        nonmono = int((pos0[1:] < pos0[:-1]).sum().item()) if sl_int > 1 else 0
-                        head_stats.append(
-                            f"{i}:len={sl_int},start={int(pos0[0].item())},end={int(pos0[-1].item())},"
-                            f"min={int(pos0.min().item())},max={int(pos0.max().item())},dec={nonmono}"
-                        )
-                    logger.info(
-                        "[THD_DIAG][mrope] pre_thd cp_size=%d num_seqs=%d total_len=%d seq_lens_head=%s seg_stats_head=%s",
-                        int(cp_size),
-                        int(num_seqs),
-                        int(total_len),
-                        seq_lens[:show_n],
-                        "; ".join(head_stats),
-                    )
-
                 position_ids = packed_pos
 
                 attn_mask_bool = attention_mask.bool()
@@ -669,58 +565,6 @@ class Qwen3VLModel(MegatronModule):
                     .permute(2, 0, 1)
                     .contiguous()
                 )
-                if _thd_diag_mrope_enabled() and _rank0():
-                    pos0_post = position_ids[0, 0]
-                    post_len = int(pos0_post.numel())
-                    head_vals = pos0_post[:12].tolist()
-                    tail_vals = pos0_post[-12:].tolist() if post_len > 12 else []
-                    nonmono_post = int((pos0_post[1:] < pos0_post[:-1]).sum().item()) if post_len > 1 else 0
-                    logger.info(
-                        "[THD_DIAG][mrope] post_thd cp_size=%d len=%d min=%d max=%d dec=%d head=%s tail=%s",
-                        int(cp_size),
-                        post_len,
-                        int(pos0_post.min().item()) if post_len > 0 else -1,
-                        int(pos0_post.max().item()) if post_len > 0 else -1,
-                        nonmono_post,
-                        head_vals,
-                        tail_vals,
-                    )
-                    # Strict check: verify THD-remapped position_ids equals explicit bool-mask gather
-                    # semantics for cp_size==1. This is diagnostics-only.
-                    if int(cp_size) == 1:
-                        tp_size = int(self.pg_collection.tp.size())
-                        align_size = tp_size
-                        packed_pos_bsd = packed_pos.permute(1, 2, 0).contiguous()  # [1, S, 3]
-                        valid_len = int(attn_mask_bool[0].sum().item())
-                        padded_len = valid_len + ((align_size - (valid_len % align_size)) % align_size)
-                        expected_bsd = torch.zeros(
-                            (1, padded_len, packed_pos_bsd.size(-1)),
-                            dtype=packed_pos_bsd.dtype,
-                            device=packed_pos_bsd.device,
-                        )
-                        expected_bsd[0, :valid_len] = packed_pos_bsd[0, attn_mask_bool[0]]
-                        expected_pid = expected_bsd.permute(2, 0, 1).contiguous()
-
-                        same = bool(torch.equal(position_ids, expected_pid))
-                        mismatch = (position_ids != expected_pid).any(dim=0).squeeze(0)
-                        mismatch_cnt = int(mismatch.sum().item())
-                        mismatch_idx = torch.nonzero(mismatch, as_tuple=False).flatten()
-                        head_idx = mismatch_idx[:8].tolist()
-                        tail_idx = mismatch_idx[-8:].tolist() if mismatch_idx.numel() > 8 else []
-                        logger.info(
-                            "[THD_DIAG][mrope] strict_match=%s mismatch_count=%d expected_len=%d actual_len=%d mismatch_head=%s mismatch_tail=%s",
-                            str(same),
-                            mismatch_cnt,
-                            int(expected_pid.size(-1)),
-                            int(position_ids.size(-1)),
-                            head_idx,
-                            tail_idx,
-                        )
-                    else:
-                        logger.info(
-                            "[THD_DIAG][mrope] strict_match_skipped cp_size=%d (currently only checks cp_size==1)",
-                            int(cp_size),
-                        )
                 attention_mask = None
                 self.language_model.rotary_pos_emb.is_thd_format = True
             else:
@@ -749,29 +593,9 @@ class Qwen3VLModel(MegatronModule):
         if packed_seq_params is not None and lm_input_ids is not None:
             if moe_padding_mask_for_lm is not None:
                 padding_mask_for_moe = moe_padding_mask_for_lm.bool()
-                mask_source = "explicit"
             else:
                 # Fallback for old call sites that do not provide explicit packed padding mask.
                 padding_mask_for_moe = lm_input_ids.eq(0)
-                mask_source = "token_eq_0_fallback"
-            if _thd_diag_enabled() and _rank0():
-                input_zero_cnt = int(input_ids.eq(0).sum().item()) if input_ids is not None else -1
-                lm_zero_cnt = int(lm_input_ids.eq(0).sum().item())
-                pad_cnt = int(padding_mask_for_moe.sum().item())
-                tok_cnt = int(padding_mask_for_moe.numel())
-                loss_valid = int((loss_mask > 0).sum().item()) if loss_mask is not None else -1
-                loss_total = int(loss_mask.numel()) if loss_mask is not None else -1
-                logger.info(
-                    "[THD_DIAG][model] padding_mask_for_moe: source=%s total_tokens=%d padding_tokens=%d valid_tokens=%d input_zero_tokens=%d lm_zero_tokens=%d loss_valid_tokens=%d loss_total_tokens=%d",
-                    mask_source,
-                    tok_cnt,
-                    pad_cnt,
-                    tok_cnt - pad_cnt,
-                    input_zero_cnt,
-                    lm_zero_cnt,
-                    loss_valid,
-                    loss_total,
-                )
 
         output = self.language_model(
             input_ids=lm_input_ids,

@@ -15,7 +15,6 @@
 import bisect
 import dataclasses
 import logging
-import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -42,27 +41,6 @@ from megatron.bridge.training.utils.visual_inputs import Qwen2_5_VLVisualInputs
 
 
 logger = logging.getLogger(__name__)
-_LOW_CONTENT_LOG_COUNT = 0
-
-
-def _thd_diag_enabled() -> bool:
-    return os.environ.get("THD_DIAG", "0") not in ("0", "", "false", "False")
-
-
-def _thd_diag_low_content_threshold() -> int:
-    raw = os.environ.get("THD_DIAG_LOW_CONTENT_TOKENS", "2048")
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return 2048
-
-
-def _thd_diag_max_low_content_logs() -> int:
-    raw = os.environ.get("THD_DIAG_MAX_LOW_CONTENT_LOGS", "100")
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return 100
 
 
 def _search_for_fit(numbers: List[int], capacity: int) -> int:
@@ -533,15 +511,6 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
         total_packed = int(cu_lengths[-1].item())
         max_sub_len = max(sub_lengths)
 
-        if _thd_diag_enabled():
-            logger.info(
-                f"[PackingStats] packed {len(samples)} samples → {total_packed} tokens "
-                f"(seq_len={self.seq_len}, utilization={total_packed / self.seq_len * 100:.1f}%), "
-                f"sub_lengths={sub_lengths}, "
-                f"image_tokens={total_image_tokens}, video_tokens={total_video_tokens}, "
-                f"text_tokens={total_text_tokens}, vit_patches={total_vit_patches}"
-            )
-
         return QwenVLTaskSamplePacked(
             __key__="+".join(s.__key__ for s in samples),
             __subflavors__=samples[0].__subflavors__,
@@ -659,9 +628,6 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
         if is_packed:
             batch_size = len(samples)
             fixed_len = self.seq_len
-            low_content_threshold = _thd_diag_low_content_threshold()
-            max_low_content_logs = _thd_diag_max_low_content_logs()
-            diag_enabled = _thd_diag_enabled()
 
             text_mat = np.full((batch_size, fixed_len), pad_token_id, dtype=np.int64)
             target_mat = np.full((batch_size, fixed_len), pad_token_id, dtype=np.int64)
@@ -683,36 +649,6 @@ class QwenVLTaskEncoder(DefaultTaskEncoder[ChatMLSample, QwenVLTaskSample, QwenV
                 cu[cu > fixed_len] = fixed_len
                 cu_lengths_list.append(cu)
                 max_lengths_list.append(s.max_length)
-
-                pad_len = fixed_len - actual_len
-                if diag_enabled:
-                    logger.info(
-                        f"[BatchStats] sample {i}: {s.num_sub_samples} sub-seqs packed, "
-                        f"content={actual_len}, pad={pad_len}, "
-                        f"image_toks={s.num_image_tokens}, video_toks={s.num_video_tokens}, "
-                        f"text_toks={s.num_text_tokens}, vit_patches={s.num_vit_patches}, "
-                        f"utilization={actual_len / fixed_len * 100:.1f}%"
-                    )
-                    global _LOW_CONTENT_LOG_COUNT
-                    if (
-                        low_content_threshold > 0
-                        and actual_len < low_content_threshold
-                        and _LOW_CONTENT_LOG_COUNT < max_low_content_logs
-                    ):
-                        logger.warning(
-                            "[LowContentPackedSample] key=%s content=%d pad=%d seq_len=%d utilization=%.1f%% "
-                            "sub_samples=%d sub_lengths=%s image_toks=%d text_toks=%d",
-                            s.__key__,
-                            actual_len,
-                            pad_len,
-                            fixed_len,
-                            actual_len / fixed_len * 100.0,
-                            s.num_sub_samples,
-                            s.sub_sample_lengths,
-                            s.num_image_tokens,
-                            s.num_text_tokens,
-                        )
-                        _LOW_CONTENT_LOG_COUNT += 1
 
             tokens = torch.from_numpy(text_mat)
             tokens[tokens == pad_token_id] = 0
